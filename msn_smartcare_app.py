@@ -228,16 +228,29 @@ def next_ticket_no():
 
 def warranty_end(install_date, months):
     d = pd.to_datetime(install_date).date()
+    months = 0 if pd.isna(months) else int(months)
     # Approximation by months using pandas offset
-    return (pd.Timestamp(d) + pd.DateOffset(months=int(months))).date()
+    return (pd.Timestamp(d) + pd.DateOffset(months=months)).date()
 
 def maintenance_due(last_maintenance, install_date, interval_days):
-    base = pd.to_datetime(last_maintenance if last_maintenance else install_date).date()
-    return base + timedelta(days=int(interval_days))
+    # Use pd.isna() instead of a plain truthy check: NaN/NaT values coming
+    # back from pandas (e.g. when last_maintenance is NULL for every row)
+    # are truthy in Python, so a bare `if last_maintenance` would wrongly
+    # keep them instead of falling back to install_date.
+    has_last_maintenance = last_maintenance is not None and not pd.isna(last_maintenance) and str(last_maintenance).strip() != ""
+    base_value = last_maintenance if has_last_maintenance else install_date
+    base = pd.to_datetime(base_value).date()
+    interval_days = 90 if pd.isna(interval_days) else int(interval_days)
+    return base + timedelta(days=interval_days)
 
 def get_warranty_status(install_date, months):
-    end = warranty_end(install_date, months)
-    delta = (end - date.today()).days
+    try:
+        end = warranty_end(install_date, months)
+        if pd.isna(end):
+            return "Tidak Diketahui"
+        delta = (end - date.today()).days
+    except (TypeError, ValueError):
+        return "Tidak Diketahui"
     if delta < 0:
         return "Expired"
     elif delta <= 30:
@@ -245,8 +258,13 @@ def get_warranty_status(install_date, months):
     return "Aktif"
 
 def get_maintenance_status(last_maintenance, install_date, interval_days):
-    due = maintenance_due(last_maintenance, install_date, interval_days)
-    delta = (due - date.today()).days
+    try:
+        due = maintenance_due(last_maintenance, install_date, interval_days)
+        if pd.isna(due):
+            return "Tidak Diketahui"
+        delta = (due - date.today()).days
+    except (TypeError, ValueError):
+        return "Tidak Diketahui"
     if delta < 0:
         return "Terlambat"
     elif delta <= 14:
@@ -866,7 +884,7 @@ elif menu == "Simulasi Pendapatan & BEP":
     )
 
     st.dataframe(
-        projection.applymap(lambda x: rupiah(x) if isinstance(x, (int, float)) else x),
+        projection.map(lambda x: rupiah(x) if isinstance(x, (int, float)) else x),
         use_container_width=True,
         hide_index=True
     )
