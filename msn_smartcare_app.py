@@ -1784,15 +1784,33 @@ elif menu == "Rencana Investasi":
                 "Batas periode simulasi (bulan)", min_value=12, max_value=120,
                 value=60, step=12, key="inv_sim_horizon_v2"
             )
-        with sim_c:
-            st.metric("Cadangan kas", "20% dari laba bersih")
-            st.write("Investasi di bawah Rp50 juta: **25%** dari laba setelah cadangan.")
-            st.write("Investasi Rp50 juta atau lebih: **50%** dari laba setelah cadangan.")
-
-        investor_share_pct = 50 if investment >= 50_000_000 else 25
+        # Default porsi investor mengikuti tier investasi sebelumnya, tetapi pengguna
+        # dapat mengubahnya. Slider diterapkan pada laba setelah cadangan kas.
+        default_investor_pct = 50 if investment >= 50_000_000 else 25
+        with st.expander("Atur parameter bagi hasil dan cadangan kas", expanded=True):
+            param_a, param_b = st.columns(2)
+            with param_a:
+                investor_share_pct = st.slider(
+                    "Porsi investor dari laba setelah cadangan (%)",
+                    min_value=0, max_value=100, value=int(default_investor_pct), step=1,
+                    key="inv_sim_share_pct_v3",
+                    help="Nilai awal 25% untuk investasi di bawah Rp50 juta dan 50% untuk investasi Rp50 juta ke atas. Anda bebas mengubahnya."
+                )
+            with param_b:
+                reserve_pct = st.slider(
+                    "Cadangan kas dari laba bersih (%)",
+                    min_value=0, max_value=80, value=20, step=1,
+                    key="inv_sim_reserve_pct_v3",
+                    help="Persentase laba bersih positif yang ditahan sebagai cadangan perusahaan."
+                )
         investor_share_rate = investor_share_pct / 100
-        reserve_rate = 0.20
+        reserve_rate = reserve_pct / 100
         distributable_rate = 1 - reserve_rate
+        st.caption(
+            f"Parameter aktif: cadangan kas {reserve_pct}% dari laba bersih positif; "
+            f"investor menerima {investor_share_pct}% dari laba setelah cadangan. "
+            f"Bagian perusahaan dari laba setelah cadangan adalah {100-investor_share_pct}%."
+        )
 
         st.markdown("#### Input laba bersih aktual per bulan")
         st.info(
@@ -1870,7 +1888,7 @@ elif menu == "Rencana Investasi":
             schedule.append({
                 "Bulan": month,
                 "Laba Bersih Aktual (Rp)": net_profit,
-                "Cadangan Kas 20% (Rp)": reserve_amount,
+                f"Cadangan Kas {reserve_pct}% (Rp)": reserve_amount,
                 "Laba Setelah Cadangan (Rp)": distributable_profit,
                 "Porsi Investor (Rp)": investor_pool,
                 "Pengembalian Pokok (Rp)": repayment,
@@ -1903,7 +1921,7 @@ elif menu == "Rencana Investasi":
         else:
             st.warning("Pokok investasi belum kembali dalam periode simulasi berdasarkan laba aktual/proyeksi yang dimasukkan.")
         st.caption(
-            f"Rumus: cadangan = 20% × laba bersih positif; laba setelah cadangan = 80%; "
+            f"Rumus: cadangan = {reserve_pct}% × laba bersih positif; laba setelah cadangan = {100-reserve_pct}%; "
             f"alokasi investor = {investor_share_pct}% × laba setelah cadangan. "
             "Pada bulan rugi atau laba nol, cadangan dan pembayaran investor adalah Rp0."
         )
@@ -1934,7 +1952,7 @@ elif menu == "Rencana Investasi":
             sensitivity_rows.append({
                 "Skenario": label,
                 "Rata-rata Laba Bersih/Bulan": rupiah(case_profit),
-                "Cadangan Kas 20%": rupiah(case_profit * reserve_rate),
+                f"Cadangan Kas {reserve_pct}%": rupiah(case_profit * reserve_rate),
                 "Alokasi Investor/Bulan": rupiah(monthly_investor_pool),
                 "Estimasi Bulan Pengembalian": months_case if months_case is not None else "Tidak terhitung",
             })
@@ -1942,7 +1960,7 @@ elif menu == "Rencana Investasi":
 
         st.warning(
             "Penting: simulasi menggunakan laba bersih aktual/proyeksi yang diinput per bulan. "
-            "Cadangan kas 20% dihitung dari laba bersih positif. Pembayaran investor tidak dijamin "
+            f"Cadangan kas {reserve_pct}% dihitung dari laba bersih positif. Pembayaran investor tidak dijamin "
             "dan hanya dilakukan jika laba tersedia serta kondisi kas memungkinkan. Definisi laba bersih, "
             "perlakuan kerugian, prioritas pengembalian pokok, durasi bagi hasil lanjutan, dan mekanisme "
             "keluar harus disepakati dalam perjanjian tertulis."
