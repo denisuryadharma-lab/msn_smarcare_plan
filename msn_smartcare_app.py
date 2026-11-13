@@ -1901,7 +1901,7 @@ elif menu == "Rencana Investasi":
 
         schedule_df = pd.DataFrame(schedule)
         total_actual_profit = float(actual_input_df["Laba Bersih Aktual (Rp)"].sum())
-        total_reserve = float(schedule_df["Cadangan Kas 20% (Rp)"].sum())
+        total_reserve = float(cumulative_reserve)  # memakai akumulasi aktual; aman untuk persentase cadangan yang dapat diubah
         total_received = float(schedule_df["Pengembalian Pokok (Rp)"].sum() + schedule_df["Bagi Hasil Investor (Rp)"].sum())
         average_positive_profit = float(actual_input_df.loc[actual_input_df["Laba Bersih Aktual (Rp)"] > 0, "Laba Bersih Aktual (Rp)"].mean()) if (actual_input_df["Laba Bersih Aktual (Rp)"] > 0).any() else 0
 
