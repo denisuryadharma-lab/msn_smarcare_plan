@@ -1757,163 +1757,195 @@ elif menu == "Rencana Investasi":
     with tab_simulasi:
         st.markdown("#### Simulasi Keuntungan & Pengembalian Modal Investor")
         st.caption(
-            "Ubah asumsi di bawah untuk melihat estimasi pembagian hasil. "
-            "Perhitungan menggunakan laba bersih yang tersedia untuk dibagikan, bukan omzet."
+            "Skema Principal First: 20% laba bersih aktual disisihkan sebagai cadangan kas. "
+            "Dari 80% sisanya, porsi investor adalah 25% untuk investasi di bawah Rp50 juta "
+            "atau 50% untuk investasi Rp50 juta ke atas. Selama pokok belum lunas, seluruh "
+            "alokasi investor digunakan untuk mengembalikan pokok. Setelah lunas, alokasi "
+            "investor menjadi bagi hasil lanjutan sesuai durasi perjanjian."
         )
 
         sim_a, sim_b, sim_c = st.columns(3)
         with sim_a:
             investment = st.number_input(
                 "Nilai investasi (Rp)", min_value=1_000_000, value=50_000_000,
-                step=1_000_000, key="inv_sim_modal"
+                step=1_000_000, key="inv_sim_modal_v2"
             )
-            monthly_profit = st.number_input(
-                "Asumsi laba bersih per bulan (Rp)", min_value=0, value=5_000_000,
-                step=500_000, key="inv_sim_profit"
+            base_monthly_profit = st.number_input(
+                "Laba bersih acuan per bulan (Rp)", min_value=0, value=5_000_000,
+                step=500_000, key="inv_sim_profit_v2",
+                help="Nilai awal untuk mengisi tabel. Anda dapat mengubah laba bersih setiap bulan pada tabel aktual di bawah."
             )
         with sim_b:
-            repayment_pct = st.number_input(
-                "Porsi laba untuk pengembalian modal (%)", min_value=1, max_value=100,
-                value=60, step=5, key="inv_sim_repayment_pct"
-            )
-            post_return_pct = st.number_input(
-                "Bagi hasil setelah modal kembali (%)", min_value=0, max_value=100,
-                value=20, step=5, key="inv_sim_post_pct"
-            )
-        with sim_c:
             post_return_months = st.number_input(
                 "Durasi bagi hasil setelah modal kembali (bulan)", min_value=0,
-                max_value=120, value=24, step=1, key="inv_sim_post_months"
+                max_value=120, value=24, step=1, key="inv_sim_post_months_v2"
             )
             max_sim_months = st.number_input(
                 "Batas periode simulasi (bulan)", min_value=12, max_value=120,
-                value=60, step=12, key="inv_sim_horizon"
+                value=60, step=12, key="inv_sim_horizon_v2"
             )
+        with sim_c:
+            st.metric("Cadangan kas", "20% dari laba bersih")
+            st.write("Investasi di bawah Rp50 juta: **25%** dari laba setelah cadangan.")
+            st.write("Investasi Rp50 juta atau lebih: **50%** dari laba setelah cadangan.")
 
-        repayment_rate = repayment_pct / 100
-        post_rate = post_return_pct / 100
-        monthly_repayment = monthly_profit * repayment_rate
+        investor_share_pct = 50 if investment >= 50_000_000 else 25
+        investor_share_rate = investor_share_pct / 100
+        reserve_rate = 0.20
+        distributable_rate = 1 - reserve_rate
 
-        # Tahap 1: distribusi laba untuk mengembalikan pokok investasi.
-        if monthly_repayment > 0:
-            payback_months = int(math.ceil(investment / monthly_repayment))
-            payback_label = f"{payback_months} bulan"
+        st.markdown("#### Input laba bersih aktual per bulan")
+        st.info(
+            "Masukkan laba bersih aktual/proyeksi untuk setiap bulan. Jika pada pertengahan bulan "
+            "target belum tercapai, cukup perbarui nilai bulan tersebut setelah tutup buku. "
+            "Nilai negatif menunjukkan rugi; tidak ada pembagian atau pengembalian pokok pada bulan rugi."
+        )
+        if "inv_sim_monthly_actual_v2" not in st.session_state or len(st.session_state["inv_sim_monthly_actual_v2"]) != int(max_sim_months):
+            st.session_state["inv_sim_monthly_actual_v2"] = pd.DataFrame({
+                "Bulan": list(range(1, int(max_sim_months) + 1)),
+                "Laba Bersih Aktual (Rp)": [int(base_monthly_profit)] * int(max_sim_months),
+            })
         else:
-            payback_months = None
-            payback_label = "Belum dapat dihitung (laba/porsi pengembalian = Rp0)"
+            # Keep user-edited monthly figures; only ensure month labels match the selected horizon.
+            st.session_state["inv_sim_monthly_actual_v2"]["Bulan"] = list(range(1, int(max_sim_months) + 1))
+
+        actual_input_df = st.data_editor(
+            st.session_state["inv_sim_monthly_actual_v2"],
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            key="inv_sim_actual_editor_v2",
+            column_config={
+                "Bulan": st.column_config.NumberColumn("Bulan", disabled=True, format="%d"),
+                "Laba Bersih Aktual (Rp)": st.column_config.NumberColumn(
+                    "Laba Bersih Aktual (Rp)", min_value=-1_000_000_000,
+                    max_value=10_000_000_000, step=100_000, format="Rp %d"
+                ),
+            },
+        )
+        st.session_state["inv_sim_monthly_actual_v2"] = actual_input_df.copy()
 
         schedule = []
         principal_remaining = float(investment)
         cumulative_to_investor = 0.0
+        cumulative_reserve = 0.0
         post_month_count = 0
         recovered_at = None
+        total_investor_principal = 0.0
+        total_investor_profit = 0.0
 
-        for month in range(1, int(max_sim_months) + 1):
+        for _, actual_row in actual_input_df.iterrows():
+            month = int(actual_row["Bulan"])
+            net_profit = float(actual_row["Laba Bersih Aktual (Rp)"])
+            reserve_amount = max(net_profit, 0.0) * reserve_rate
+            distributable_profit = max(net_profit, 0.0) - reserve_amount
+            investor_pool = distributable_profit * investor_share_rate
             repayment = 0.0
             profit_share = 0.0
-            phase = "Menunggu laba tersedia"
 
-            if principal_remaining > 0 and monthly_repayment > 0:
-                repayment = min(principal_remaining, monthly_repayment)
+            if net_profit <= 0:
+                phase = "Rugi / tidak ada pembagian"
+            elif principal_remaining > 0 and investor_pool > 0:
+                repayment = min(principal_remaining, investor_pool)
                 principal_remaining -= repayment
-                phase = "Pengembalian modal"
+                total_investor_principal += repayment
+                phase = "Pengembalian pokok"
                 if principal_remaining <= 0.005:
                     principal_remaining = 0.0
                     recovered_at = month
             elif principal_remaining <= 0 and post_month_count < int(post_return_months):
-                profit_share = monthly_profit * post_rate
+                profit_share = investor_pool
+                total_investor_profit += profit_share
                 post_month_count += 1
-                phase = "Bagi hasil pasca pengembalian modal"
+                phase = "Bagi hasil setelah pokok kembali"
             elif principal_remaining <= 0:
                 phase = "Masa bagi hasil selesai"
+            else:
+                phase = "Laba tersedia, menunggu alokasi"
 
-            received = repayment + profit_share
-            cumulative_to_investor += received
+            investor_received = repayment + profit_share
+            cumulative_to_investor += investor_received
+            cumulative_reserve += reserve_amount
+            company_share = max(distributable_profit - investor_pool, 0.0)
             schedule.append({
                 "Bulan": month,
-                "Tahap": phase,
+                "Laba Bersih Aktual (Rp)": net_profit,
+                "Cadangan Kas 20% (Rp)": reserve_amount,
+                "Laba Setelah Cadangan (Rp)": distributable_profit,
+                "Porsi Investor (Rp)": investor_pool,
                 "Pengembalian Pokok (Rp)": repayment,
-                "Bagi Hasil (Rp)": profit_share,
-                "Total Diterima Bulan Ini (Rp)": received,
+                "Bagi Hasil Investor (Rp)": profit_share,
+                "Bagian Perusahaan (Rp)": company_share,
                 "Sisa Pokok (Rp)": principal_remaining,
-                "Akumulasi Diterima (Rp)": cumulative_to_investor,
+                "Akumulasi Diterima Investor (Rp)": cumulative_to_investor,
+                "Tahap": phase,
             })
 
-        if monthly_profit > 0:
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Investasi", rupiah(investment))
-            m2.metric("Alokasi pengembalian/bulan", rupiah(monthly_repayment))
-            m3.metric("Estimasi modal kembali", payback_label)
-            post_monthly_share = monthly_profit * post_rate
-            m4.metric("Bagi hasil pasca modal/bulan", rupiah(post_monthly_share))
-        else:
-            st.warning("Laba bersih bulanan masih Rp0. Pengembalian modal dan bagi hasil belum dapat disimulasikan.")
+        schedule_df = pd.DataFrame(schedule)
+        total_actual_profit = float(actual_input_df["Laba Bersih Aktual (Rp)"].sum())
+        total_reserve = float(schedule_df["Cadangan Kas 20% (Rp)"].sum())
+        total_received = float(schedule_df["Pengembalian Pokok (Rp)"].sum() + schedule_df["Bagi Hasil Investor (Rp)"].sum())
+        average_positive_profit = float(actual_input_df.loc[actual_input_df["Laba Bersih Aktual (Rp)"] > 0, "Laba Bersih Aktual (Rp)"].mean()) if (actual_input_df["Laba Bersih Aktual (Rp)"] > 0).any() else 0
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Investasi", rupiah(investment))
+        k2.metric("Porsi investor", f"{investor_share_pct}%")
+        k3.metric("Cadangan kas terkumpul", rupiah(total_reserve))
+        k4.metric("Total diterima investor", rupiah(total_received))
+
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Pokok yang sudah kembali", rupiah(total_investor_principal))
+        r2.metric("Sisa pokok investasi", rupiah(principal_remaining))
+        r3.metric("Keuntungan pasca-pokok", rupiah(total_investor_profit))
 
         if recovered_at is not None:
-            total_post_share = monthly_profit * post_rate * int(post_return_months)
-            total_received_if_completed = investment + total_post_share
-            total_profit_investor = total_post_share
-            roi_pct = (total_profit_investor / investment * 100) if investment else 0
-            st.success(
-                f"Dengan asumsi laba bersih stabil {rupiah(monthly_profit)}/bulan, "
-                f"pokok investasi diproyeksikan kembali pada bulan ke-{recovered_at}. "
-                f"Jika periode bagi hasil berikutnya terpenuhi, investor menerima total "
-                f"{rupiah(total_received_if_completed)} (pokok {rupiah(investment)} + "
-                f"potensi keuntungan {rupiah(total_post_share)}; ROI ilustratif {pct_id(roi_pct, 1)})."
-            )
+            st.success(f"Pokok investasi diproyeksikan kembali pada bulan ke-{recovered_at} berdasarkan input laba bulanan.")
         else:
-            st.info(
-                "Pokok investasi belum kembali dalam batas periode simulasi. "
-                "Perpanjang batas periode atau ubah asumsi laba dan porsi pengembalian."
-            )
+            st.warning("Pokok investasi belum kembali dalam periode simulasi berdasarkan laba aktual/proyeksi yang dimasukkan.")
+        st.caption(
+            f"Rumus: cadangan = 20% × laba bersih positif; laba setelah cadangan = 80%; "
+            f"alokasi investor = {investor_share_pct}% × laba setelah cadangan. "
+            "Pada bulan rugi atau laba nol, cadangan dan pembayaran investor adalah Rp0."
+        )
 
-        st.markdown("#### Proyeksi arus pengembalian per bulan")
-        schedule_df = pd.DataFrame(schedule)
+        st.markdown("#### Proyeksi arus kas dan pengembalian per bulan")
         if not schedule_df.empty:
-            chart_df = schedule_df.set_index("Bulan")[[
-                "Akumulasi Diterima (Rp)", "Sisa Pokok (Rp)"
-            ]]
+            chart_df = schedule_df.set_index("Bulan")[["Akumulasi Diterima Investor (Rp)", "Sisa Pokok (Rp)"]]
             st.line_chart(chart_df, use_container_width=True)
-
             display_schedule = schedule_df.copy()
-            money_cols = [
-                "Pengembalian Pokok (Rp)", "Bagi Hasil (Rp)",
-                "Total Diterima Bulan Ini (Rp)", "Sisa Pokok (Rp)",
-                "Akumulasi Diterima (Rp)"
-            ]
+            money_cols = [c for c in display_schedule.columns if c.endswith("(Rp)")]
             for col in money_cols:
                 display_schedule[col] = display_schedule[col].map(rupiah)
             st.dataframe(display_schedule, use_container_width=True, hide_index=True)
-
-            csv_data = schedule_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "Unduh proyeksi arus pengembalian (CSV)",
-                data=csv_data,
-                file_name="simulasi_pengembalian_investor_msn_smartcare.csv",
-                mime="text/csv"
+                data=schedule_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="simulasi_pengembalian_principal_first_msn_smartcare.csv",
+                mime="text/csv",
             )
 
-        st.markdown("#### Analisis sensitivitas berdasarkan laba bersih bulanan")
+        st.markdown("#### Ringkasan asumsi dan sensitivitas")
+        st.caption("Sensitivitas memakai rata-rata laba positif dari tabel bulanan; ini hanya pembanding, bukan jaminan.")
         sensitivity_rows = []
-        for profit_case in [monthly_profit * 0.6, monthly_profit, monthly_profit * 1.4]:
-            repayment_case = profit_case * repayment_rate
-            months_case = math.ceil(investment / repayment_case) if repayment_case > 0 else None
+        for label, factor in [("Konservatif (-40%)", 0.6), ("Dasar", 1.0), ("Optimistis (+40%)", 1.4)]:
+            case_profit = average_positive_profit * factor
+            monthly_investor_pool = case_profit * distributable_rate * investor_share_rate
+            months_case = math.ceil(investment / monthly_investor_pool) if monthly_investor_pool > 0 else None
             sensitivity_rows.append({
-                "Skenario": (
-                    "Konservatif (-40%)" if profit_case < monthly_profit
-                    else ("Optimistis (+40%)" if profit_case > monthly_profit else "Dasar")
-                ),
-                "Laba Bersih/Bulan": rupiah(profit_case),
-                "Alokasi Pengembalian/Bulan": rupiah(repayment_case),
-                "Estimasi Bulan Pengembalian": months_case if months_case is not None else "Tidak terhitung"
+                "Skenario": label,
+                "Rata-rata Laba Bersih/Bulan": rupiah(case_profit),
+                "Cadangan Kas 20%": rupiah(case_profit * reserve_rate),
+                "Alokasi Investor/Bulan": rupiah(monthly_investor_pool),
+                "Estimasi Bulan Pengembalian": months_case if months_case is not None else "Tidak terhitung",
             })
         st.dataframe(pd.DataFrame(sensitivity_rows), use_container_width=True, hide_index=True)
 
         st.warning(
-            "Penting: hasil ini adalah simulasi, bukan janji atau jaminan keuntungan maupun pengembalian modal. "
-            "Pembagian hanya dapat dilakukan jika laba benar-benar tersedia dan kondisi kas memungkinkan. "
-            "Definisi laba bersih, urutan pembayaran, hak investor, risiko kerugian, masa kerja sama, "
-            "serta mekanisme penghentian/keluar harus disepakati dalam perjanjian tertulis."
+            "Penting: simulasi menggunakan laba bersih aktual/proyeksi yang diinput per bulan. "
+            "Cadangan kas 20% dihitung dari laba bersih positif. Pembayaran investor tidak dijamin "
+            "dan hanya dilakukan jika laba tersedia serta kondisi kas memungkinkan. Definisi laba bersih, "
+            "perlakuan kerugian, prioritas pengembalian pokok, durasi bagi hasil lanjutan, dan mekanisme "
+            "keluar harus disepakati dalam perjanjian tertulis."
         )
 
     with tab_road:
