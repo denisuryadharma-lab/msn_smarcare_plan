@@ -1,4 +1,11 @@
 
+import base64
+import io
+import math
+import zipfile
+from html import escape
+from urllib.parse import quote
+
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -13,17 +20,39 @@ from pathlib import Path
 # 2. Data perangkat CCTV/PABX/Roller Blind
 # 3. Status garansi dan maintenance
 # 4. Form ticket kerusakan
-# 5. Simulasi pendapatan dan BEP
+# 5. Simulasi pendapatan dan BEP (margin proyek + subscription)
+# 6. Simulasi ROE dan ROA
+# 7. Pipeline proyek (Lead -> Survey -> Penawaran -> Instalasi)
+# 8. QR Aset perangkat
+# 9. Kontrak AMC & Subscription
+# 10. Laporan digital per pelanggan
+# 11. Rencana investasi & roadmap
 # =========================================================
 
 APP_TITLE = "MSN SmartCare"
 DB_PATH = Path("msn_smartcare.db")
 
+# Master pilihan - disesuaikan dengan isi PPT (slide 4, 13, 19, 20)
+DEVICE_TYPES = ["CCTV", "PABX", "LAN/Fiber Optik", "Cable Tray", "Roller Blind", "iPad Charging Box"]
+CUSTOMER_CATEGORIES = [
+    "Sekolah & Kampus", "Perkantoran & Ruko", "Perumahan/Cluster",
+    "Klinik/Rumah Sakit", "Korporasi & Properti", "Pemerintahan & Institusi", "Lainnya"
+]
+PIPELINE_STAGES = ["Lead/Request", "Survey Lokasi", "Penawaran", "Instalasi", "Selesai"]
+CONTRACT_TYPES = ["Subscription SmartCare", "AMC 6 Bulan", "AMC 12 Bulan"]
+CONTRACT_STATUSES = ["Aktif", "Berakhir", "Dibatalkan"]
+# Normalisasi kategori lama agar sama dengan istilah di PPT
+CATEGORY_MIGRATION = {
+    "Kampus": "Sekolah & Kampus", "Kampus/Sekolah": "Sekolah & Kampus",
+    "Perkantoran": "Perkantoran & Ruko", "Ruko": "Perkantoran & Ruko",
+    "Perumahan": "Perumahan/Cluster",
+}
+
 st.set_page_config(
     page_title=APP_TITLE,
     page_icon="🛠️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # -----------------------------
@@ -113,9 +142,76 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_name TEXT NOT NULL,
+            segment TEXT,
+            service TEXT,
+            stage TEXT DEFAULT 'Lead/Request',
+            est_value REAL DEFAULT 0,
+            contact TEXT,
+            created_date TEXT NOT NULL,
+            notes TEXT,
+            customer_id INTEGER,
+            FOREIGN KEY(customer_id) REFERENCES customers(id)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS contracts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            contract_type TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            duration_months INTEGER DEFAULT 12,
+            monthly_fee REAL DEFAULT 0,
+            status TEXT DEFAULT 'Aktif',
+            notes TEXT,
+            FOREIGN KEY(customer_id) REFERENCES customers(id)
+        )
+    """)
+
     conn.commit()
     seed_data(conn)
+    migrate_and_seed_extra(conn)
     conn.close()
+
+def migrate_and_seed_extra(conn):
+    """Normalisasi kategori pelanggan + data contoh untuk pipeline & kontrak (hanya jika kosong)."""
+    cur = conn.cursor()
+    for old, new in CATEGORY_MIGRATION.items():
+        cur.execute("UPDATE customers SET category=? WHERE category=?", (new, old))
+
+    if cur.execute("SELECT COUNT(*) AS n FROM leads").fetchone()["n"] == 0:
+        today = date.today()
+        cur.executemany("""
+            INSERT INTO leads(lead_name, segment, service, stage, est_value, contact, created_date, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            ("SMK Contoh Nusantara", "Sekolah & Kampus", "CCTV + LAN/Fiber Optik", "Survey Lokasi",
+             18_000_000, "0812-0000-0001", str(today - timedelta(days=6)), "Data contoh"),
+            ("Klinik Sehat Contoh", "Klinik/Rumah Sakit", "CCTV + Roller Blind", "Penawaran",
+             25_000_000, "0812-0000-0002", str(today - timedelta(days=12)), "Data contoh"),
+            ("Ruko Mega Contoh", "Perkantoran & Ruko", "PABX + Cable Tray", "Lead/Request",
+             12_000_000, "0812-0000-0003", str(today - timedelta(days=1)), "Data contoh"),
+        ])
+
+    if cur.execute("SELECT COUNT(*) AS n FROM contracts").fetchone()["n"] == 0:
+        cust = {r["name"]: r["id"] for r in cur.execute("SELECT id, name FROM customers").fetchall()}
+        today = date.today()
+        samples = [
+            ("PT Graha Digital", "Subscription SmartCare", 60, 12, 400_000),
+            ("Universitas Contoh", "AMC 12 Bulan", 100, 12, 400_000),
+        ]
+        for name, ctype, days_ago, months, fee in samples:
+            if name in cust:
+                cur.execute("""
+                    INSERT INTO contracts(customer_id, contract_type, start_date, duration_months,
+                                          monthly_fee, status, notes)
+                    VALUES (?, ?, ?, ?, ?, 'Aktif', 'Data contoh')
+                """, (cust[name], ctype, str(today - timedelta(days=days_ago)), months, fee))
+    conn.commit()
 
 def seed_data(conn):
     cur = conn.cursor()
@@ -124,9 +220,9 @@ def seed_data(conn):
         return
 
     customers = [
-        ("Universitas Contoh", "Kampus", "Budi Santoso", "0812-1111-2222", "Jakarta"),
-        ("PT Graha Digital", "Perkantoran", "Siti Rahma", "0813-3333-4444", "Tangerang"),
-        ("Cluster Harmoni", "Perumahan", "Andi Pratama", "0815-5555-6666", "Tangerang"),
+        ("Universitas Contoh", "Sekolah & Kampus", "Budi Santoso", "0812-1111-2222", "Jakarta"),
+        ("PT Graha Digital", "Perkantoran & Ruko", "Siti Rahma", "0813-3333-4444", "Tangerang"),
+        ("Cluster Harmoni", "Perumahan/Cluster", "Andi Pratama", "0815-5555-6666", "Tangerang"),
     ]
     cur.executemany("""
         INSERT INTO customers(name, category, pic, phone, address)
@@ -277,6 +373,143 @@ def rupiah(x):
     except:
         return str(x)
 
+def enrich_devices(df):
+    """Tambah kolom garansi & maintenance turunan pada dataframe perangkat."""
+    df = df.copy()
+    if df.empty:
+        return df
+    df["warranty_end"] = df.apply(lambda r: warranty_end(r["install_date"], r["warranty_months"]), axis=1)
+    df["warranty_status"] = df.apply(lambda r: get_warranty_status(r["install_date"], r["warranty_months"]), axis=1)
+    df["next_maintenance"] = df.apply(
+        lambda r: maintenance_due(r["last_maintenance"], r["install_date"], r["maintenance_interval_days"]), axis=1)
+    df["maintenance_status"] = df.apply(
+        lambda r: get_maintenance_status(r["last_maintenance"], r["install_date"], r["maintenance_interval_days"]), axis=1)
+    return df
+
+def show_df_or_info(df, empty_msg):
+    """Tampilkan tabel, atau pesan info jika kosong (pakai if/else biasa agar tidak memicu 'magic' Streamlit)."""
+    if df is None or df.empty:
+        st.info(empty_msg)
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+LOGO_SVG = (
+    '<svg viewBox="0 0 70 40" xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">'
+    '<path d="M10 6 L22 2 L34 6 V18 C34 26 29 31 22 34 C15 31 10 26 10 18 Z" fill="#1b2a4e"/>'
+    '<path d="M16 18 l4 4 l8 -9" stroke="#ffffff" stroke-width="3" fill="none" '
+    'stroke-linecap="round" stroke-linejoin="round"/>'
+    '<text x="38" y="17" font-family="Arial,sans-serif" font-weight="800" font-size="10" fill="#1b2a4e">MSN</text>'
+    '<text x="38" y="27" font-family="Arial,sans-serif" font-weight="700" font-size="6" fill="#b71c1c">CARE</text>'
+    '</svg>'
+)
+
+def logo_html():
+    """Pakai logo.png / logo.jpg / logo.svg di folder aplikasi jika ada; jika tidak, pakai logo bawaan."""
+    for fname, mime in (("logo.png", "image/png"), ("logo.jpg", "image/jpeg"),
+                        ("logo.jpeg", "image/jpeg"), ("logo.svg", "image/svg+xml")):
+        p = Path(fname)
+        if p.exists():
+            b64 = base64.b64encode(p.read_bytes()).decode()
+            return f'<img src="data:{mime};base64,{b64}" alt="logo" style="max-width:100%;max-height:100%;">'
+    return LOGO_SVG
+
+BRAND_HTML = (
+    '<div class="brand">'
+    '<div class="brand-logo">__LOGO__</div>'
+    '<div><div class="brand-title">MSN SmartCare</div>'
+    '<div class="brand-sub">CV Mitra Solution Network</div></div>'
+    '</div>'
+)
+
+def qr_png_bytes(text):
+    """Buat QR code PNG. Mengembalikan None jika paket 'qrcode' belum terpasang."""
+    try:
+        import qrcode
+    except ImportError:
+        return None
+    img = qrcode.make(text)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+def qr_payload(code, name, customer, location, base_url=""):
+    base_url = (base_url or "").strip()
+    if base_url:
+        return f"{base_url.rstrip('/')}/?device={quote(code)}"
+    return f"MSN SmartCare\nKode: {code}\nPerangkat: {name}\nPelanggan: {customer}\nLokasi: {location or '-'}"
+
+def render_device_detail(code):
+    """Halaman detail perangkat yang dibuka dari scan QR (?device=KODE)."""
+    df = query_df("""
+        SELECT d.*, c.name AS customer_name, c.pic, c.phone
+        FROM devices d JOIN customers c ON c.id = d.customer_id
+        WHERE d.device_code = ?
+    """, (code,))
+    st.markdown('<div class="main-title">Detail Perangkat</div>', unsafe_allow_html=True)
+    if df.empty:
+        st.error(f"Perangkat dengan kode {code} tidak ditemukan.")
+        return
+    df = enrich_devices(df)
+    r = df.iloc[0]
+    st.markdown(f'<div class="sub-title">{escape(str(r["device_code"]))} - {escape(str(r["device_name"]))}</div>',
+                unsafe_allow_html=True)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Status Perangkat", r["status"])
+    m2.metric("Garansi", r["warranty_status"], help=f"Berakhir {r['warranty_end']}")
+    m3.metric("Maintenance", r["maintenance_status"], help=f"Jadwal berikut {r['next_maintenance']}")
+    st.write(f"**Pelanggan:** {r['customer_name']}  |  **PIC:** {r['pic'] or '-'}  |  **Telepon:** {r['phone'] or '-'}")
+    st.write(f"**Jenis:** {r['device_type']}  |  **Merek:** {r['brand'] or '-'}  |  **Lokasi:** {r['location'] or '-'}")
+    st.write(f"**Tanggal instalasi:** {r['install_date']}  |  **Garansi s/d:** {r['warranty_end']}  |  "
+             f"**Maintenance terakhir:** {r['last_maintenance'] or '-'}")
+    st.subheader("Riwayat Maintenance")
+    logs = query_df("""SELECT maintenance_date, activity, technician, result
+                       FROM maintenance_logs WHERE device_id=? ORDER BY id DESC""", (int(r["id"]),))
+    if logs.empty:
+        st.info("Belum ada riwayat maintenance.")
+    else:
+        st.dataframe(logs, use_container_width=True, hide_index=True)
+    st.subheader("Riwayat Ticket")
+    tk = query_df("""SELECT ticket_no, created_date, priority, problem, status, closed_date
+                     FROM tickets WHERE device_id=? ORDER BY id DESC""", (int(r["id"]),))
+    if tk.empty:
+        st.info("Belum ada ticket untuk perangkat ini.")
+    else:
+        st.dataframe(tk, use_container_width=True, hide_index=True)
+
+def build_report_html(customer, dev_view, tk_view, log_view, ct_view, summary):
+    css = ("body{font-family:Arial,sans-serif;margin:32px;color:#123c5e}"
+           "h1{margin-bottom:0}h2{margin-top:28px;border-bottom:2px solid #cfe0f3;padding-bottom:4px}"
+           "table{border-collapse:collapse;width:100%;font-size:12px}"
+           "th,td{border:1px solid #cfe0f3;padding:6px 8px;text-align:left;vertical-align:top}"
+           "th{background:#eaf2fb}.sum span{display:inline-block;margin-right:24px}")
+    def tbl(df):
+        return "<p><i>Tidak ada data.</i></p>" if df.empty else df.to_html(index=False, border=0)
+    s = "".join(f"<span><b>{escape(k)}:</b> {escape(str(v))}</span>" for k, v in summary.items())
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>Laporan {escape(str(customer['name']))}</title><style>{css}</style></head><body>"
+        "<h1>Laporan Layanan MSN SmartCare</h1>"
+        f"<p>CV Mitra Solution Network | Dicetak: {date.today()}</p>"
+        f"<h2>Pelanggan</h2><p><b>{escape(str(customer['name']))}</b> ({escape(str(customer['category'] or '-'))})<br>"
+        f"PIC: {escape(str(customer['pic'] or '-'))} | Telepon: {escape(str(customer['phone'] or '-'))}<br>"
+        f"Alamat: {escape(str(customer['address'] or '-'))}</p>"
+        f"<div class='sum'>{s}</div>"
+        f"<h2>Perangkat, Garansi & Maintenance</h2>{tbl(dev_view)}"
+        f"<h2>Riwayat Maintenance</h2>{tbl(log_view)}"
+        f"<h2>Ticket Kerusakan</h2>{tbl(tk_view)}"
+        f"<h2>Kontrak AMC & Subscription</h2>{tbl(ct_view)}"
+        "</body></html>"
+    )
+
+def pct_id(x, decimals=0):
+    """Format persen gaya Indonesia, mis. 96% atau 12,5%."""
+    s = f"{x:,.{decimals}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return s + "%"
+
+def num_id(x, decimals=2):
+    """Format angka desimal gaya Indonesia, mis. 0,96."""
+    return f"{x:,.{decimals}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
 # -----------------------------
 # Styling
 # -----------------------------
@@ -295,6 +528,72 @@ st.markdown("""
         font-size: 0.85rem;
         color: #777;
     }
+    .ratio-card {
+        border-radius: 32px;
+        padding: 1.6rem 1.5rem;
+        min-height: 480px;
+        display: flex;
+        flex-direction: column;
+    }
+    .ratio-light {
+        background: #f8fbff;
+        border: 2px solid #cfe0f3;
+        color: #123c5e;
+    }
+    .ratio-dark {
+        background: #123c5e;
+        border: 2px solid #123c5e;
+        color: #ffffff;
+    }
+    .ratio-label {
+        font-size: 0.8rem;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        color: #1e88e5;
+        text-transform: uppercase;
+    }
+    .ratio-name { font-size: 2.2rem; font-weight: 800; margin: 0.8rem 0 0.6rem 0; }
+    .ratio-section { font-size: 0.95rem; margin-bottom: 1rem; line-height: 1.5; }
+    .ratio-value { font-size: 3.4rem; font-weight: 800; text-align: center; margin-top: auto; line-height: 1.1; }
+    .ratio-desc { font-size: 0.82rem; text-align: center; line-height: 1.45; margin-top: 0.4rem; }
+    /* ===== Header & menu atas ===== */
+    [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"] { display: none !important; }
+    header[data-testid="stHeader"] { display: none; }
+    .block-container { padding-top: 0 !important; padding-left: 2rem !important;
+                       padding-right: 2rem !important; max-width: 100% !important; }
+    .topbar { background: #1b2a4e; border-bottom: 4px solid #b71c1c;
+              margin: 0 -2rem 1.5rem -2rem; padding: 0.9rem 2rem 0.8rem 2rem; }
+    .brand { display: flex; align-items: center; gap: 0.9rem; margin-bottom: 0.8rem; }
+    .brand-logo { width: 64px; height: 44px; background: #ffffff; border-radius: 10px;
+                  padding: 4px 6px; display: flex; align-items: center; justify-content: center; }
+    .brand-title { color: #ffffff; font-size: 1.1rem; font-weight: 800; line-height: 1.2; }
+    .brand-sub { color: #c9d3ea; font-size: 0.8rem; }
+    .navbtns { display: flex; flex-wrap: wrap; gap: 0.3rem 0.35rem; }
+    .navbtns a, .navbtns a:link, .navbtns a:visited {
+        display: inline-block; padding: 0.5rem 0.95rem; border-radius: 8px;
+        background: transparent; color: #ffffff !important; font-size: 0.93rem; font-weight: 500;
+        text-decoration: none !important; line-height: 1.2; border: 0; }
+    .navbtns a:hover { background: rgba(255,255,255,0.14); color: #ffffff !important; }
+    .navbtns a.active, .navbtns a.active:visited {
+        background: rgba(255,255,255,0.24); color: #ffffff !important; font-weight: 700; }
+    .flow-wrap { display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 0.5rem 0 1.2rem 0; }
+    .flow-step { flex: 1 1 120px; border-radius: 16px; padding: 0.7rem 0.8rem; min-width: 120px; }
+    .flow-pre { background: #9dc3e6; color: #123c5e; }
+    .flow-post { background: #123c5e; color: #ffffff; }
+    .flow-num { font-size: 0.75rem; font-weight: 800; opacity: 0.8; }
+    .flow-name { font-size: 1rem; font-weight: 800; }
+    .flow-sub { font-size: 0.72rem; opacity: 0.85; }
+    .interpretation-box {
+        background: #f5f9ff;
+        border: 1.5px solid #cfe0f3;
+        border-radius: 12px;
+        padding: 0.7rem 1rem;
+        text-align: center;
+        font-weight: 700;
+        color: #123c5e;
+        margin-top: 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -303,19 +602,48 @@ st.markdown("""
 # -----------------------------
 init_db()
 
-st.sidebar.title("MSN SmartCare")
-st.sidebar.caption("CV Mitra Solution Network")
-menu = st.sidebar.radio(
-    "Menu",
-    [
-        "Dashboard",
-        "Data Perangkat",
-        "Garansi & Maintenance",
-        "Ticket Kerusakan",
-        "Simulasi Pendapatan & BEP",
-        "Data Pelanggan"
-    ]
-)
+MENU_ITEMS = [
+    ("dashboard", "Dashboard"),
+    ("pipeline", "Pipeline Proyek"),
+    ("perangkat", "Data Perangkat"),
+    ("qr", "QR Aset"),
+    ("garansi", "Garansi & Maintenance"),
+    ("ticket", "Ticket Kerusakan"),
+    ("kontrak", "Kontrak & Subscription"),
+    ("laporan", "Laporan Digital"),
+    ("bep", "Simulasi Pendapatan & BEP"),
+    ("roe-roa", "Simulasi ROE & ROA"),
+    ("investasi", "Rencana Investasi"),
+    ("pelanggan", "Data Pelanggan"),
+]
+
+def nav_html(active_slug):
+    links = "".join(
+        f'<a href="?menu={slug}" target="_self" class="{"active" if slug == active_slug else ""}">{escape(label)}</a>'
+        for slug, label in MENU_ITEMS
+    )
+    return f'<div class="navbtns">{links}</div>'
+
+brand_html = BRAND_HTML.replace("__LOGO__", logo_html())
+
+# Halaman detail perangkat jika QR di-scan (?device=KODE)
+scan_code = st.query_params.get("device")
+if scan_code:
+    st.markdown(f'<div class="topbar">{brand_html}</div>', unsafe_allow_html=True)
+    render_device_detail(scan_code)
+    if st.button("Buka aplikasi MSN SmartCare"):
+        st.query_params.clear()
+        st.rerun()
+    st.stop()
+
+# Menu aktif dibaca dari ?menu=... (default: Dashboard)
+slug_to_label = dict(MENU_ITEMS)
+active_slug = st.query_params.get("menu", MENU_ITEMS[0][0])
+if active_slug not in slug_to_label:
+    active_slug = MENU_ITEMS[0][0]
+menu = slug_to_label[active_slug]
+
+st.markdown(f'<div class="topbar">{brand_html}{nav_html(active_slug)}</div>', unsafe_allow_html=True)
 
 # =========================================================
 # 1. DASHBOARD
@@ -418,7 +746,7 @@ if menu == "Dashboard":
 # =========================================================
 elif menu == "Data Perangkat":
     st.markdown('<div class="main-title">Data Perangkat</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-title">CCTV, PABX, dan Roller Blind yang terpasang pada pelanggan.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-title">Inventaris CCTV, PABX, LAN/Fiber Optik, Cable Tray, Roller Blind, dan iPad Charging Box.</div>', unsafe_allow_html=True)
 
     customers = query_df("SELECT id, name FROM customers ORDER BY name")
     customer_map = dict(zip(customers["name"], customers["id"])) if not customers.empty else {}
@@ -431,7 +759,7 @@ elif menu == "Data Perangkat":
                 customer_name = st.selectbox("Pelanggan", list(customer_map.keys()))
                 device_code = st.text_input("Kode Perangkat", placeholder="Contoh: CCTV-010")
                 device_name = st.text_input("Nama Perangkat", placeholder="Contoh: CCTV Lobby Utama")
-                device_type = st.selectbox("Jenis Perangkat", ["CCTV", "PABX", "Roller Blind"])
+                device_type = st.selectbox("Jenis Perangkat", DEVICE_TYPES)
                 brand = st.text_input("Merek")
 
             with col2:
@@ -765,53 +1093,428 @@ elif menu == "Ticket Kerusakan":
                 st.rerun()
 
 # =========================================================
-# 5. SIMULASI PENDAPATAN & BEP
+# 7. PIPELINE PROYEK (Slide 13: Lead -> Survey -> Penawaran -> Instalasi)
+# =========================================================
+elif menu == "Pipeline Proyek":
+    st.markdown('<div class="main-title">Pipeline Proyek</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-title">Alur operasional digital: dari permintaan pelanggan sampai laporan maintenance.</div>',
+        unsafe_allow_html=True
+    )
+
+    flow = [
+        ("1", "Lead/Request", "Pipeline Proyek", "pre"),
+        ("2", "Survey Lokasi", "Pipeline Proyek", "pre"),
+        ("3", "Penawaran", "Pipeline Proyek", "pre"),
+        ("4", "Instalasi", "Pipeline Proyek", "pre"),
+        ("5", "QR Aset", "Menu QR Aset", "post"),
+        ("6", "Ticketing", "Menu Ticket Kerusakan", "post"),
+        ("7", "Maintenance", "Menu Garansi & Maintenance", "post"),
+        ("8", "Laporan", "Menu Laporan Digital", "post"),
+    ]
+    flow_html = '<div class="flow-wrap">' + "".join(
+        f'<div class="flow-step flow-{kind}"><div class="flow-num">{n} - '
+        f'{"Tahap proyek awal" if kind == "pre" else "Layanan pasca proyek"}</div>'
+        f'<div class="flow-name">{name}</div><div class="flow-sub">{menu_name}</div></div>'
+        for n, name, menu_name, kind in flow
+    ) + "</div>"
+    st.markdown(flow_html, unsafe_allow_html=True)
+
+    leads = query_df("SELECT * FROM leads ORDER BY id DESC")
+
+    cols = st.columns(len(PIPELINE_STAGES))
+    for col, stage in zip(cols, PIPELINE_STAGES):
+        col.metric(stage, 0 if leads.empty else int((leads["stage"] == stage).sum()))
+    running_value = 0 if leads.empty else float(leads.loc[leads["stage"] != "Selesai", "est_value"].sum())
+    st.metric("Estimasi Nilai Proyek Berjalan (belum selesai)", rupiah(running_value))
+
+    with st.expander("➕ Tambah Lead / Permintaan Baru", expanded=False):
+        with st.form("lead_form"):
+            a, b = st.columns(2)
+            with a:
+                lead_name = st.text_input("Nama Calon Pelanggan")
+                segment = st.selectbox("Segmen", CUSTOMER_CATEGORIES)
+                service = st.text_input("Layanan yang Diminta", placeholder="Contoh: CCTV + LAN/Fiber Optik")
+            with b:
+                est_value = st.number_input("Estimasi Nilai Proyek (Rp)", min_value=0, value=0, step=500_000)
+                contact = st.text_input("Kontak / WhatsApp")
+                notes = st.text_area("Catatan")
+            add_lead = st.form_submit_button("Simpan Lead", type="primary")
+            if add_lead:
+                if not lead_name.strip():
+                    st.error("Nama calon pelanggan wajib diisi.")
+                else:
+                    conn = get_conn()
+                    conn.execute("""
+                        INSERT INTO leads(lead_name, segment, service, stage, est_value, contact, created_date, notes)
+                        VALUES (?, ?, ?, 'Lead/Request', ?, ?, ?, ?)
+                    """, (lead_name.strip(), segment, service.strip(), float(est_value),
+                          contact.strip(), str(date.today()), notes.strip()))
+                    conn.commit()
+                    conn.close()
+                    st.success("Lead berhasil ditambahkan.")
+                    st.rerun()
+
+    st.subheader("Daftar Lead & Proyek")
+    if leads.empty:
+        st.info("Belum ada lead.")
+    else:
+        stage_filter = st.selectbox("Filter tahap", ["Semua"] + PIPELINE_STAGES)
+        view = leads if stage_filter == "Semua" else leads[leads["stage"] == stage_filter]
+        view = view.copy()
+        view["est_value"] = view["est_value"].apply(rupiah)
+        st.dataframe(
+            view[["lead_name", "segment", "service", "stage", "est_value", "contact", "created_date", "notes"]],
+            use_container_width=True, hide_index=True
+        )
+
+        st.subheader("Update Tahap Proyek")
+        lead_map = {f'{r["lead_name"]} - {r["stage"]}': int(r["id"]) for _, r in leads.iterrows()}
+        with st.form("lead_update_form"):
+            selected = st.selectbox("Pilih Lead", list(lead_map.keys()))
+            new_stage = st.selectbox("Tahap Baru", PIPELINE_STAGES)
+            make_customer = st.checkbox(
+                "Jika tahap 'Selesai', daftarkan otomatis sebagai pelanggan (bila belum terdaftar)", value=True
+            )
+            upd = st.form_submit_button("Update Tahap", type="primary")
+            if upd:
+                lead_id = lead_map[selected]
+                lead = leads[leads["id"] == lead_id].iloc[0]
+                conn = get_conn()
+                conn.execute("UPDATE leads SET stage=? WHERE id=?", (new_stage, lead_id))
+                if new_stage == "Selesai" and make_customer and pd.isna(lead["customer_id"]):
+                    existing = conn.execute(
+                        "SELECT id FROM customers WHERE name=?", (lead["lead_name"],)
+                    ).fetchone()
+                    if existing:
+                        cid = existing["id"]
+                    else:
+                        cur = conn.execute("""
+                            INSERT INTO customers(name, category, pic, phone, address)
+                            VALUES (?, ?, '', ?, '')
+                        """, (lead["lead_name"], lead["segment"], lead["contact"] or ""))
+                        cid = cur.lastrowid
+                    conn.execute("UPDATE leads SET customer_id=? WHERE id=?", (cid, lead_id))
+                conn.commit()
+                conn.close()
+                if new_stage == "Selesai":
+                    st.success("Proyek selesai. Lanjutkan: daftarkan perangkat di 'Data Perangkat' dan cetak QR di 'QR Aset'.")
+                else:
+                    st.success("Tahap proyek diperbarui.")
+                st.rerun()
+
+# =========================================================
+# 8. QR ASET (Slide 8: satu identitas digital untuk setiap perangkat)
+# =========================================================
+elif menu == "QR Aset":
+    st.markdown('<div class="main-title">QR Aset Perangkat</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-title">Satu identitas digital untuk setiap perangkat: tempel QR di perangkat, scan untuk melihat status dan histori.</div>',
+        unsafe_allow_html=True
+    )
+
+    devices = query_df("""
+        SELECT d.device_code, d.device_name, d.device_type, d.location, c.name AS customer_name
+        FROM devices d JOIN customers c ON c.id = d.customer_id
+        ORDER BY c.name, d.device_code
+    """)
+
+    if devices.empty:
+        st.info("Belum ada perangkat. Tambahkan perangkat terlebih dahulu di menu 'Data Perangkat'.")
+    else:
+        base_url = st.text_input(
+            "URL aplikasi (opsional)",
+            value="",
+            placeholder="https://alamat-aplikasi-anda.com",
+            help="Jika diisi, QR akan membuka halaman detail perangkat di aplikasi ini. "
+                 "Jika kosong, QR berisi teks identitas perangkat."
+        )
+        options = {
+            f'{r["device_code"]} - {r["device_name"]} - {r["customer_name"]}': r
+            for _, r in devices.iterrows()
+        }
+        selected = st.selectbox("Pilih Perangkat", list(options.keys()))
+        r = options[selected]
+        payload = qr_payload(r["device_code"], r["device_name"], r["customer_name"], r["location"], base_url)
+        png = qr_png_bytes(payload)
+
+        left, right = st.columns([1, 2])
+        with left:
+            if png is None:
+                st.warning("Paket 'qrcode' belum terpasang. Jalankan: pip install -r requirements.txt")
+            else:
+                st.image(png, caption=r["device_code"], width=240)
+                st.download_button("⬇️ Unduh QR (PNG)", data=png,
+                                   file_name=f'QR-{r["device_code"]}.png', mime="image/png")
+        with right:
+            st.write(f"**Perangkat:** {r['device_name']} ({r['device_type']})")
+            st.write(f"**Pelanggan:** {r['customer_name']}")
+            st.write(f"**Lokasi:** {r['location'] or '-'}")
+            st.caption("Isi QR:")
+            st.code(payload, language=None)
+
+        if png is not None and st.checkbox("Siapkan ZIP QR untuk semua perangkat"):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for _, d in devices.iterrows():
+                    data = qr_png_bytes(qr_payload(d["device_code"], d["device_name"],
+                                                   d["customer_name"], d["location"], base_url))
+                    zf.writestr(f'QR-{d["device_code"]}.png', data)
+            st.download_button("⬇️ Unduh ZIP semua QR", data=buf.getvalue(),
+                               file_name="QR-semua-perangkat.zip", mime="application/zip")
+
+# =========================================================
+# 9. KONTRAK AMC & SUBSCRIPTION (Slide 6: recurring revenue)
+# =========================================================
+elif menu == "Kontrak & Subscription":
+    st.markdown('<div class="main-title">Kontrak AMC & Subscription</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-title">Mesin pendapatan berulang: Annual Maintenance Contract (AMC) dan Subscription MSN SmartCare.</div>',
+        unsafe_allow_html=True
+    )
+
+    customers = query_df("SELECT id, name FROM customers ORDER BY name")
+    customer_map = dict(zip(customers["name"], customers["id"])) if not customers.empty else {}
+
+    contracts = query_df("""
+        SELECT k.*, c.name AS customer_name
+        FROM contracts k JOIN customers c ON c.id = k.customer_id
+        ORDER BY k.id DESC
+    """)
+
+    if not contracts.empty:
+        contracts["end_date"] = contracts.apply(
+            lambda r: (pd.Timestamp(r["start_date"]) + pd.DateOffset(months=int(r["duration_months"]))).date(), axis=1
+        )
+        contracts["sisa_hari"] = contracts["end_date"].apply(lambda d: (d - date.today()).days)
+
+        def effective_status(r):
+            if r["status"] != "Aktif":
+                return r["status"]
+            if r["sisa_hari"] < 0:
+                return "Berakhir"
+            return "Segera Berakhir" if r["sisa_hari"] <= 30 else "Aktif"
+
+        contracts["status_efektif"] = contracts.apply(effective_status, axis=1)
+        active = contracts[contracts["status_efektif"].isin(["Aktif", "Segera Berakhir"])]
+        n_active = len(active)
+        n_subs = int(active["contract_type"].str.startswith("Subscription").sum())
+        recurring = float(active["monthly_fee"].sum())
+        n_soon = int((contracts["status_efektif"] == "Segera Berakhir").sum())
+    else:
+        n_active = n_subs = n_soon = 0
+        recurring = 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Kontrak Aktif", n_active)
+    c2.metric("Subscription Aktif", n_subs)
+    c3.metric("Kontribusi Laba Berulang / Bulan", rupiah(recurring))
+    c4.metric("Segera Berakhir (≤30 hari)", n_soon)
+    st.caption("Pembanding: asumsi business plan = 5 subscription dengan kontribusi laba Rp400.000/klien/bulan (Rp2.000.000/bulan).")
+
+    with st.expander("➕ Tambah Kontrak / Subscription", expanded=False):
+        if not customer_map:
+            st.warning("Tambahkan pelanggan terlebih dahulu.")
+        else:
+            with st.form("contract_form"):
+                a, b = st.columns(2)
+                with a:
+                    cust_name = st.selectbox("Pelanggan", list(customer_map.keys()))
+                    ctype = st.selectbox("Jenis Layanan", CONTRACT_TYPES)
+                    start_date = st.date_input("Tanggal Mulai", value=date.today())
+                with b:
+                    duration = st.number_input(
+                        "Durasi (bulan)", min_value=1, max_value=60, value=12,
+                        help="Untuk AMC 6/12 Bulan, durasi otomatis mengikuti jenis layanan."
+                    )
+                    fee = st.number_input("Kontribusi Laba / Bulan (Rp)", min_value=0, value=400_000, step=50_000)
+                    notes = st.text_input("Catatan")
+                save_ct = st.form_submit_button("Simpan Kontrak", type="primary")
+                if save_ct:
+                    months = 6 if ctype == "AMC 6 Bulan" else (12 if ctype == "AMC 12 Bulan" else int(duration))
+                    conn = get_conn()
+                    conn.execute("""
+                        INSERT INTO contracts(customer_id, contract_type, start_date, duration_months,
+                                              monthly_fee, status, notes)
+                        VALUES (?, ?, ?, ?, ?, 'Aktif', ?)
+                    """, (int(customer_map[cust_name]), ctype, str(start_date), months, float(fee), notes.strip()))
+                    conn.commit()
+                    conn.close()
+                    st.success("Kontrak berhasil disimpan.")
+                    st.rerun()
+
+    st.subheader("Daftar Kontrak")
+    if contracts.empty:
+        st.info("Belum ada kontrak.")
+    else:
+        view = contracts.copy()
+        view["monthly_fee"] = view["monthly_fee"].apply(rupiah)
+        st.dataframe(
+            view[["customer_name", "contract_type", "start_date", "duration_months",
+                  "end_date", "sisa_hari", "monthly_fee", "status_efektif", "notes"]],
+            use_container_width=True, hide_index=True
+        )
+
+        st.subheader("Update Status Kontrak")
+        ct_map = {
+            f'{r["customer_name"]} - {r["contract_type"]} (mulai {r["start_date"]})': int(r["id"])
+            for _, r in contracts.iterrows()
+        }
+        with st.form("contract_update_form"):
+            sel = st.selectbox("Pilih Kontrak", list(ct_map.keys()))
+            new_status = st.selectbox("Status Baru", CONTRACT_STATUSES)
+            upd = st.form_submit_button("Update Status", type="primary")
+            if upd:
+                conn = get_conn()
+                conn.execute("UPDATE contracts SET status=? WHERE id=?", (new_status, ct_map[sel]))
+                conn.commit()
+                conn.close()
+                st.success("Status kontrak diperbarui.")
+                st.rerun()
+
+# =========================================================
+# 10. LAPORAN DIGITAL (Slide 8 & 13: laporan digital per pelanggan)
+# =========================================================
+elif menu == "Laporan Digital":
+    st.markdown('<div class="main-title">Laporan Digital</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-title">Histori pekerjaan dan dokumentasi per pelanggan: perangkat, garansi, maintenance, ticket, dan kontrak.</div>',
+        unsafe_allow_html=True
+    )
+
+    customers = query_df("SELECT id, name, category, pic, phone, address FROM customers ORDER BY name")
+    if customers.empty:
+        st.info("Belum ada pelanggan.")
+    else:
+        selected = st.selectbox("Pilih Pelanggan", customers["name"].tolist())
+        crow = customers[customers["name"] == selected].iloc[0]
+        cid = int(crow["id"])
+
+        devices = enrich_devices(query_df("SELECT * FROM devices WHERE customer_id=? ORDER BY device_code", (cid,)))
+        tickets = query_df("""
+            SELECT t.ticket_no, t.created_date, d.device_code, t.priority, t.problem,
+                   t.status, t.technician, t.resolution, t.closed_date
+            FROM tickets t LEFT JOIN devices d ON d.id = t.device_id
+            WHERE t.customer_id=? ORDER BY t.id DESC
+        """, (cid,))
+        logs = query_df("""
+            SELECT m.maintenance_date, d.device_code, m.activity, m.technician, m.result
+            FROM maintenance_logs m JOIN devices d ON d.id = m.device_id
+            WHERE d.customer_id=? ORDER BY m.id DESC
+        """, (cid,))
+        contracts_c = query_df("""
+            SELECT contract_type, start_date, duration_months, monthly_fee, status
+            FROM contracts WHERE customer_id=? ORDER BY id DESC
+        """, (cid,))
+
+        n_dev = len(devices)
+        n_warranty = 0 if devices.empty else int(devices["warranty_status"].isin(["Expired", "Segera Berakhir"]).sum())
+        n_maint = 0 if devices.empty else int(devices["maintenance_status"].isin(["Terlambat", "Jatuh Tempo"]).sum())
+        n_open = 0 if tickets.empty else int((tickets["status"] != "Closed").sum())
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Perangkat", n_dev)
+        c2.metric("Garansi Perlu Perhatian", n_warranty)
+        c3.metric("Maintenance Perlu Perhatian", n_maint)
+        c4.metric("Ticket Aktif", n_open)
+
+        if devices.empty:
+            dev_view = pd.DataFrame()
+        else:
+            dev_view = devices[[
+                "device_code", "device_name", "device_type", "location", "install_date",
+                "warranty_end", "warranty_status", "last_maintenance", "next_maintenance",
+                "maintenance_status", "status"
+            ]].rename(columns={
+                "device_code": "Kode", "device_name": "Perangkat", "device_type": "Jenis",
+                "location": "Lokasi", "install_date": "Instalasi", "warranty_end": "Garansi s/d",
+                "warranty_status": "Status Garansi", "last_maintenance": "Maintenance Terakhir",
+                "next_maintenance": "Maintenance Berikut", "maintenance_status": "Status Maintenance",
+                "status": "Status"
+            }).fillna("-")
+        tk_view = tickets.rename(columns={
+            "ticket_no": "No Ticket", "created_date": "Tanggal", "device_code": "Perangkat",
+            "priority": "Prioritas", "problem": "Masalah", "status": "Status",
+            "technician": "Teknisi", "resolution": "Solusi", "closed_date": "Ditutup"
+        }).fillna("-")
+        log_view = logs.rename(columns={
+            "maintenance_date": "Tanggal", "device_code": "Perangkat", "activity": "Aktivitas",
+            "technician": "Teknisi", "result": "Hasil"
+        }).fillna("-")
+        ct_view = contracts_c.copy()
+        if not ct_view.empty:
+            ct_view["monthly_fee"] = ct_view["monthly_fee"].apply(rupiah)
+        ct_view = ct_view.rename(columns={
+            "contract_type": "Jenis", "start_date": "Mulai", "duration_months": "Durasi (bln)",
+            "monthly_fee": "Kontribusi Laba/Bulan", "status": "Status"
+        })
+
+        st.subheader("Perangkat, Garansi & Maintenance")
+        show_df_or_info(dev_view, "Belum ada perangkat.")
+        st.subheader("Riwayat Maintenance")
+        show_df_or_info(log_view, "Belum ada riwayat maintenance.")
+        st.subheader("Ticket Kerusakan")
+        show_df_or_info(tk_view, "Belum ada ticket.")
+        st.subheader("Kontrak AMC & Subscription")
+        show_df_or_info(ct_view, "Belum ada kontrak.")
+
+        report_html = build_report_html(
+            crow, dev_view, tk_view, log_view, ct_view,
+            {"Perangkat": n_dev, "Garansi perlu perhatian": n_warranty,
+             "Maintenance perlu perhatian": n_maint, "Ticket aktif": n_open}
+        )
+        d1, d2 = st.columns(2)
+        d1.download_button("⬇️ Unduh Laporan (HTML, siap cetak/PDF)", data=report_html.encode("utf-8"),
+                           file_name=f"Laporan-{selected.replace(' ', '_')}-{date.today()}.html",
+                           mime="text/html")
+        if not dev_view.empty:
+            d2.download_button("⬇️ Unduh Data Perangkat (CSV)", data=dev_view.to_csv(index=False).encode("utf-8"),
+                               file_name=f"Perangkat-{selected.replace(' ', '_')}.csv", mime="text/csv")
+
+# =========================================================
+# 5. SIMULASI PENDAPATAN & BEP (Slide 10 & 11)
 # =========================================================
 elif menu == "Simulasi Pendapatan & BEP":
     st.markdown('<div class="main-title">Simulasi Pendapatan dan BEP</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="sub-title">Simulasi awal mengikuti konsep Business Plan MSN SmartCare: proyek instalasi + subscription.</div>',
+        '<div class="sub-title">Simulasi margin satu proyek instalasi CCTV dan proyeksi BEP dengan subscription SmartCare '
+        '(bukan data penjualan aktual).</div>',
         unsafe_allow_html=True
     )
 
-    st.info(
-        "Nilai default mengikuti simulasi business plan: 2 proyek/bulan, "
-        "laba kotor per proyek Rp3.500.000, 5 subscription, laba subscription "
-        "Rp400.000/klien/bulan, biaya tetap Rp5.000.000/bulan, dan investasi awal Rp15.000.000."
-    )
+    # ---- Slide 10: dasar asumsi margin per proyek
+    st.subheader("1. Dasar Asumsi Margin per Proyek (CCTV)")
+    m_left, m_right = st.columns(2)
+    with m_left:
+        selling_price = st.number_input("Harga jual proyek CCTV (Rp)", min_value=0, value=15_000_000, step=500_000)
+        cost_device = st.number_input("Perangkat dan material (Rp)", min_value=0, value=7_500_000, step=100_000)
+        cost_labor = st.number_input("Tenaga teknisi dan instalasi (Rp)", min_value=0, value=2_000_000, step=100_000)
+        cost_other = st.number_input("Transportasi dan biaya variabel lain (Rp)", min_value=0, value=500_000, step=100_000)
+    total_variable_cost = cost_device + cost_labor + cost_other
+    gross_profit_project = selling_price - total_variable_cost
+    with m_right:
+        st.metric("Total Biaya Variabel", rupiah(total_variable_cost))
+        st.metric("Margin Kontribusi / Proyek", rupiah(gross_profit_project))
+        st.caption("Margin kontribusi = Harga jual - total biaya variabel")
+        st.caption(f"= {rupiah(selling_price)} - {rupiah(total_variable_cost)} = {rupiah(gross_profit_project)}/proyek")
 
-    with st.form("bep_form"):
-        a, b = st.columns(2)
+    st.divider()
 
-        with a:
-            projects_per_month = st.number_input(
-                "Jumlah proyek instalasi / bulan", min_value=0, value=2, step=1
-            )
-            gross_profit_project = st.number_input(
-                "Kontribusi laba kotor / proyek (Rp)",
-                min_value=0, value=3_500_000, step=100_000
-            )
-            subscriptions = st.number_input(
-                "Jumlah pelanggan subscription", min_value=0, value=5, step=1
-            )
+    # ---- Slide 11: proyeksi pendapatan & BEP
+    st.subheader("2. Proyeksi Pendapatan dan BEP")
+    a, b = st.columns(2)
+    with a:
+        projects_per_month = st.number_input("Jumlah proyek instalasi / bulan", min_value=0, value=2, step=1)
+        subscriptions = st.number_input("Jumlah pelanggan subscription SmartCare", min_value=0, value=5, step=1)
+        profit_subscription = st.number_input(
+            "Kontribusi laba subscription / klien / bulan (Rp)", min_value=0, value=400_000, step=50_000
+        )
+    with b:
+        fixed_cost = st.number_input("Biaya tetap / bulan (Rp)", min_value=0, value=7_000_000, step=100_000)
+        initial_investment = st.number_input(
+            "Investasi awal prototype (Rp)", min_value=0, value=15_000_000, step=500_000
+        )
 
-        with b:
-            profit_subscription = st.number_input(
-                "Kontribusi laba subscription / klien / bulan (Rp)",
-                min_value=0, value=400_000, step=50_000
-            )
-            fixed_cost = st.number_input(
-                "Biaya tetap / bulan (Rp)",
-                min_value=0, value=5_000_000, step=100_000
-            )
-            initial_investment = st.number_input(
-                "Investasi awal prototype & branding (Rp)",
-                min_value=0, value=15_000_000, step=500_000
-            )
-
-        calc = st.form_submit_button("Hitung Simulasi", type="primary")
-
-    # Calculations always shown
     project_contribution = projects_per_month * gross_profit_project
     subscription_contribution = subscriptions * profit_subscription
     total_contribution = project_contribution + subscription_contribution
@@ -819,55 +1522,56 @@ elif menu == "Simulasi Pendapatan & BEP":
     annual_profit = operating_profit * 12
 
     if gross_profit_project > 0:
-        bep_projects_without_subs = fixed_cost / gross_profit_project
-        remaining_fixed = max(0, fixed_cost - subscription_contribution)
-        bep_projects_with_subs = remaining_fixed / gross_profit_project
+        bep_no_subs = fixed_cost / gross_profit_project
+        bep_with_subs = max(0, fixed_cost - subscription_contribution) / gross_profit_project
+        bep_no_subs_round = math.ceil(round(bep_no_subs, 6))
+        bep_with_subs_round = math.ceil(round(bep_with_subs, 6))
     else:
-        bep_projects_without_subs = None
-        bep_projects_with_subs = None
+        bep_no_subs = bep_with_subs = bep_no_subs_round = bep_with_subs_round = None
 
-    if operating_profit > 0:
-        payback_months = initial_investment / operating_profit
-    else:
-        payback_months = None
+    payback_months = (initial_investment / operating_profit) if operating_profit > 0 else None
 
+    st.markdown("#### Asumsi target awal")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Kontribusi Proyek", rupiah(project_contribution))
     c2.metric("Kontribusi Subscription", rupiah(subscription_contribution))
-    c3.metric("Total Kontribusi", rupiah(total_contribution))
-    c4.metric("Estimasi Laba Operasional/Bulan", rupiah(operating_profit))
+    c3.metric("Total Kontribusi Laba / Bulan", rupiah(total_contribution))
+    c4.metric("Estimasi Laba Bersih / Bulan", rupiah(operating_profit))
 
-    st.subheader("Hasil BEP")
-
+    st.markdown("#### Perhitungan BEP")
     x1, x2, x3 = st.columns(3)
-
-    if bep_projects_without_subs is not None:
-        x1.metric(
-            "BEP Tanpa Subscription",
-            f"{bep_projects_without_subs:.2f} proyek",
-            help="Biaya tetap dibagi kontribusi laba per proyek."
+    if bep_no_subs is not None:
+        x1.metric("BEP Tanpa Subscription", f"{num_id(bep_no_subs)} proyek",
+                  help="Biaya tetap / margin per proyek.")
+        x2.metric("BEP Dengan Subscription", f"{num_id(bep_with_subs)} proyek",
+                  help="(Biaya tetap - kontribusi subscription) / margin per proyek.")
+        st.caption(
+            f"Tanpa subscription: {rupiah(fixed_cost)} / {rupiah(gross_profit_project)} = {num_id(bep_no_subs)} proyek "
+            f"-> dibulatkan menjadi {bep_no_subs_round} proyek/bulan. "
+            f"Dengan subscription: ({rupiah(fixed_cost)} - {rupiah(subscription_contribution)}) / "
+            f"{rupiah(gross_profit_project)} = {num_id(bep_with_subs)} proyek -> {bep_with_subs_round} proyek/bulan."
         )
-        x2.metric(
-            "BEP Dengan Subscription",
-            f"{bep_projects_with_subs:.2f} proyek",
-            help="Biaya tetap dikurangi kontribusi subscription, kemudian dibagi kontribusi laba per proyek."
-        )
+        if projects_per_month >= bep_with_subs_round:
+            st.success(f"Target {projects_per_month} proyek/bulan sudah memenuhi BEP dengan subscription "
+                       f"({bep_with_subs_round} proyek/bulan).")
+        else:
+            st.warning(f"Target {projects_per_month} proyek/bulan masih di bawah BEP dengan subscription "
+                       f"({bep_with_subs_round} proyek/bulan).")
     else:
         x1.metric("BEP Tanpa Subscription", "-")
         x2.metric("BEP Dengan Subscription", "-")
+        st.warning("Margin per proyek harus lebih dari 0 untuk menghitung BEP.")
+    x3.metric("Payback Period", f"{num_id(payback_months)} bulan" if payback_months is not None else "Belum tercapai")
 
-    x3.metric(
-        "Payback Period",
-        f"{payback_months:.2f} bulan" if payback_months is not None else "Belum tercapai"
-    )
-
-    st.subheader("Proyeksi Tahunan")
+    st.markdown("#### Kesimpulan finansial")
     p1, p2 = st.columns(2)
-    p1.metric("Estimasi Laba Tahunan", rupiah(annual_profit))
+    p1.metric("Estimasi Laba Tahunan", rupiah(annual_profit),
+              help=f"{rupiah(operating_profit)} x 12")
     p2.metric(
         "Status Kelayakan Operasional",
         "Surplus" if operating_profit > 0 else ("BEP" if operating_profit == 0 else "Defisit")
     )
+    st.caption("Makna bisnis: subscription membuat cashflow lebih stabil dan mengurangi ketergantungan pada proyek baru.")
 
     projection = pd.DataFrame({
         "Bulan": list(range(1, 13)),
@@ -878,26 +1582,190 @@ elif menu == "Simulasi Pendapatan & BEP":
     })
     projection["Laba Kumulatif"] = projection["Laba Operasional"].cumsum()
 
-    st.line_chart(
-        projection.set_index("Bulan")[["Laba Kumulatif"]],
-        use_container_width=True
-    )
+    st.line_chart(projection.set_index("Bulan")[["Laba Kumulatif"]], use_container_width=True)
 
-    st.dataframe(
-        projection.map(lambda x: rupiah(x) if isinstance(x, (int, float)) else x),
-        use_container_width=True,
-        hide_index=True
-    )
+    money_cols = [c for c in projection.columns if c != "Bulan"]
+    shown = projection.copy()
+    shown[money_cols] = shown[money_cols].apply(lambda col: col.map(rupiah))
+    st.dataframe(shown, use_container_width=True, hide_index=True)
 
     st.markdown("### Rumus yang Digunakan")
     st.markdown("""
-- **Kontribusi Proyek** = Jumlah Proyek × Laba Kotor per Proyek
-- **Kontribusi Subscription** = Jumlah Subscription × Laba per Subscription
-- **Laba Operasional** = Total Kontribusi − Biaya Tetap
-- **BEP Proyek** = Biaya Tetap ÷ Kontribusi Laba per Proyek
-- **BEP Proyek dengan Subscription** = (Biaya Tetap − Kontribusi Subscription) ÷ Kontribusi Laba per Proyek
-- **Payback Period** = Investasi Awal ÷ Laba Operasional per Bulan
+- **Margin Kontribusi / Proyek** = Harga Jual - Total Biaya Variabel
+- **Kontribusi Proyek** = Jumlah Proyek x Margin per Proyek
+- **Kontribusi Subscription** = Jumlah Subscription x Kontribusi Laba per Subscription
+- **Laba Bersih / Bulan** = Total Kontribusi - Biaya Tetap
+- **BEP Tanpa Subscription** = Biaya Tetap / Margin per Proyek
+- **BEP Dengan Subscription** = (Biaya Tetap - Kontribusi Subscription) / Margin per Proyek
+- **Payback Period** = Investasi Awal / Laba Bersih per Bulan
 """)
+
+# =========================================================
+# 6. SIMULASI ROE & ROA
+# =========================================================
+elif menu == "Simulasi ROE & ROA":
+    st.markdown('<div class="main-title">ROE dan ROA</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-title">Simulasi rasio profitabilitas untuk menilai efisiensi modal dan aset MSN SmartCare.</div>',
+        unsafe_allow_html=True
+    )
+
+    col_data, col_roe, col_roa = st.columns(3)
+
+    with col_data:
+        with st.container(border=True):
+            st.markdown('<div class="ratio-label">Data Simulasi</div>', unsafe_allow_html=True)
+            net_profit = st.number_input(
+                "Laba bersih tahunan (Rp)", min_value=0, value=60_000_000, step=1_000_000
+            )
+            equity = st.number_input(
+                "Modal sendiri (Rp)", min_value=0, value=62_500_000, step=500_000
+            )
+            total_assets = st.number_input(
+                "Total aset operasional (Rp)", min_value=0, value=75_000_000, step=500_000
+            )
+            st.caption(
+                "Angka digunakan untuk simulasi business plan dan bisa disesuaikan dengan kondisi riil."
+            )
+
+    roe = (net_profit / equity * 100) if equity > 0 else None
+    roa = (net_profit / total_assets * 100) if total_assets > 0 else None
+
+    with col_roe:
+        if roe is None:
+            roe_value, roe_desc = "-", "Modal sendiri harus lebih dari 0 untuk menghitung ROE."
+        else:
+            roe_value = pct_id(roe)
+            roe_desc = (
+                f"setiap Rp1 modal sendiri yang ditanamkan pada MSN SmartCare menghasilkan "
+                f"Rp{num_id(roe / 100)} laba bersih dalam satu tahun.<br>"
+                f"ROE sebesar {pct_id(roe)} menunjukkan potensi pengembalian modal "
+                f"berdasarkan asumsi bisnis tersebut. Namun, angka ini merupakan proyeksi, "
+                f"bukan jaminan bahwa modal akan kembali dalam satu tahun."
+            )
+        st.markdown(f"""
+<div class="ratio-card ratio-light">
+    <div class="ratio-label">Return on Equity</div>
+    <div class="ratio-name">ROE</div>
+    <div class="ratio-section"><b>Rumus:</b><br>ROE = Laba Bersih / Modal Sendiri × 100%</div>
+    <div class="ratio-section"><b>Perhitungan:</b><br>{rupiah(net_profit)} / {rupiah(equity)} × 100%</div>
+    <div class="ratio-value">{roe_value}</div>
+    <div class="ratio-desc">{roe_desc}</div>
+</div>
+""", unsafe_allow_html=True)
+
+    with col_roa:
+        if roa is None:
+            roa_value, roa_desc = "-", "Total aset harus lebih dari 0 untuk menghitung ROA."
+        else:
+            roa_value = pct_id(roa)
+            if roa >= 20:
+                roa_desc = "aset operasional digunakan sangat produktif untuk menghasilkan laba"
+            elif roa >= 5:
+                roa_desc = "aset operasional digunakan cukup produktif untuk menghasilkan laba"
+            else:
+                roa_desc = "aset operasional belum terlalu produktif untuk menghasilkan laba"
+        st.markdown(f"""
+<div class="ratio-card ratio-dark">
+    <div class="ratio-label">Return on Assets</div>
+    <div class="ratio-name">ROA</div>
+    <div class="ratio-section"><b>Rumus:</b><br>ROA = Laba Bersih / Total Aset × 100%</div>
+    <div class="ratio-section"><b>Perhitungan:</b><br>{rupiah(net_profit)} / {rupiah(total_assets)} × 100%</div>
+    <div class="ratio-value">{roa_value}</div>
+    <div class="ratio-desc">{roa_desc}</div>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="interpretation-box">Interpretasi: semakin tinggi ROE dan ROA, '
+        'semakin efisien bisnis menggunakan modal dan aset.</div>',
+        unsafe_allow_html=True
+    )
+    st.caption("MSN SmartCare | Business Plan Technopreneur")
+
+# =========================================================
+# 11. RENCANA INVESTASI & ROADMAP (Slide 16, 22, 23, 24)
+# =========================================================
+elif menu == "Rencana Investasi":
+    st.markdown('<div class="main-title">Rencana Investasi</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-title">Skenario kebutuhan dana, skema kerja sama investor, dan roadmap implementasi - '
+        'angka indikatif untuk diskusi dengan calon investor.</div>',
+        unsafe_allow_html=True
+    )
+
+    tab_dana, tab_kerja, tab_road = st.tabs(["Penggunaan Dana", "Kerja Sama Investor", "Roadmap Implementasi"])
+
+    with tab_dana:
+        total_fund = st.number_input("Usulan pendanaan (Rp)", min_value=0, value=50_000_000, step=1_000_000)
+        allocations = [
+            ("Pengembangan platform", 40, "Pengembangan prototype, dashboard, QR aset dan ticketing"),
+            ("Pemasaran B2B", 30, "Pemasaran B2B, website, presentasi dan pilot project"),
+            ("Operasional", 20, "Kebutuhan operasional, perangkat pendukung dan teknisi"),
+            ("SOP & cadangan", 10, "Penyusunan SOP, pelatihan dan cadangan implementasi"),
+        ]
+        left, right = st.columns(2)
+        pcts = []
+        with left:
+            for label, default_pct, _ in allocations:
+                pcts.append(st.number_input(f"{label} (%)", min_value=0, max_value=100, value=default_pct, step=5))
+        total_pct = sum(pcts)
+        alloc_df = pd.DataFrame({
+            "Komponen": [a[0] for a in allocations],
+            "Persentase": pcts,
+            "Nilai (Rp)": [total_fund * p / 100 for p in pcts],
+            "Keterangan": [a[2] for a in allocations],
+        })
+        with right:
+            st.metric("Total Alokasi", f"{total_pct}%")
+            if total_pct != 100:
+                st.warning(f"Total alokasi {total_pct}%, seharusnya 100%.")
+            st.bar_chart(alloc_df.set_index("Komponen")[["Nilai (Rp)"]])
+
+        shown = alloc_df.copy()
+        shown["Persentase"] = shown["Persentase"].map(lambda p: f"{p}%")
+        shown["Nilai (Rp)"] = shown["Nilai (Rp)"].map(rupiah)
+        st.dataframe(shown, use_container_width=True, hide_index=True)
+        st.caption(
+            "Catatan: kebutuhan dana dan alokasi di atas adalah skenario usulan, bukan pendanaan yang telah diperoleh."
+        )
+
+    with tab_kerja:
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            with st.container(border=True):
+                st.markdown("**1. Kontribusi investor**")
+                st.write("Investor menyediakan pendanaan sesuai kesepakatan. Contoh kebutuhan awal Rp50 juta "
+                         "untuk pengembangan platform dan ekspansi pasar.")
+        with k2:
+            with st.container(border=True):
+                st.markdown("**2. Pelaksanaan bisnis**")
+                st.write("Dana digunakan bertahap untuk platform, pemasaran B2B, operasional, dan SOP. "
+                         "Kemajuan dipantau melalui target proyek dan subscription.")
+        with k3:
+            with st.container(border=True):
+                st.markdown("**3. Evaluasi & imbal hasil**")
+                st.write("Investor menerima laporan keuangan dan kinerja berkala. Skema bagi hasil atau "
+                         "kepemilikan dibahas berdasarkan hasil uji kelayakan.")
+        st.markdown("#### Cara bergabung")
+        st.write("Diskusi proposal -> evaluasi proyeksi dan risiko -> kesepakatan tertulis mengenai modal, "
+                 "hak, dan kewajiban.")
+        st.info("Tujuan bersama: memperbanyak proyek, meningkatkan pelanggan berlangganan, dan membangun "
+                "pendapatan berulang. Rp50 juta adalah simulasi kebutuhan dana; keuntungan dan pengembalian "
+                "modal tidak dijamin.")
+
+    with tab_road:
+        phases = [
+            ("0-3 Bulan", "Prototype SmartCare, katalog digital, database aset sederhana"),
+            ("4-6 Bulan", "Pilot project pada 3-5 pelanggan, SOP ticketing, QR aset"),
+            ("7-9 Bulan", "Paket subscription, dashboard laporan, integrasi WA reminder"),
+            ("10-12 Bulan", "Ekspansi pasar institusi, rekrut teknisi mitra, evaluasi BEP"),
+        ]
+        for col, (period, desc) in zip(st.columns(4), phases):
+            with col:
+                with st.container(border=True):
+                    st.markdown(f"**{period}**")
+                    st.write(desc)
 
 # =========================================================
 # DATA PELANGGAN
@@ -909,10 +1777,7 @@ elif menu == "Data Pelanggan":
     with st.expander("➕ Tambah Pelanggan", expanded=False):
         with st.form("customer_form"):
             name = st.text_input("Nama Pelanggan")
-            category = st.selectbox(
-                "Kategori",
-                ["Kampus/Sekolah", "Perkantoran", "Ruko", "Perumahan", "Klinik/Rumah Sakit", "Lainnya"]
-            )
+            category = st.selectbox("Kategori", CUSTOMER_CATEGORIES)
             pic = st.text_input("PIC")
             phone = st.text_input("Telepon / WhatsApp")
             address = st.text_area("Alamat")
@@ -941,6 +1806,5 @@ elif menu == "Data Pelanggan":
 # -----------------------------
 # Footer
 # -----------------------------
-st.sidebar.divider()
-st.sidebar.caption("Prototype Technopreneur - MSN SmartCare")
-st.sidebar.caption("CV Mitra Solution Network")
+st.divider()
+st.caption("Prototype Technopreneur - MSN SmartCare | CV Mitra Solution Network")
